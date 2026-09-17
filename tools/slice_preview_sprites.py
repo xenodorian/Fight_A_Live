@@ -109,33 +109,10 @@ def split_wide_islands(islands, mask_fg):
     return result
 
 
-RIM_DIST_THRESH = 110  # boundary pixels still this close to BG color are anti-aliasing halo, not sprite detail
-RIM_STRIP_ITERS = 3    # passes of boundary-only stripping; eats through a couple px of gray fringe
-
-
-def strip_gray_rim(rgb, alpha_mask):
-    """The alpha cutoff alone leaves a thin ring of pixels that are opaque
-    (connected to the sprite, so clean_alpha's speckle filter won't touch
-    them) but still color-blended partway to the background -- a visible
-    gray outline. Peel it off: repeatedly drop boundary pixels whose color
-    is still close to BG, leaving true-colored edges (e.g. orange hair)
-    alone since they're far from gray in color-distance."""
-    mask = alpha_mask.copy()
-    dist = np.abs(rgb.astype(int) - BG).sum(axis=-1)
-    grayish = dist < RIM_DIST_THRESH
-    for _ in range(RIM_STRIP_ITERS):
-        boundary = mask & ~ndimage.binary_erosion(mask)
-        strip = boundary & grayish
-        if not strip.any():
-            break
-        mask = mask & ~strip
-    return mask
-
-
 def clean_alpha(rgba):
     """Drop isolated opaque speckle (webp compression noise not touching the
-    sprite), strip the gray anti-aliasing rim, and keep the alpha cutout
-    strict so no background-blend halo survives around the silhouette."""
+    sprite) and keep the alpha cutout strict so no gray background-blend
+    halo survives around the silhouette."""
     alpha = rgba[:, :, 3] > 0
     labels, n = ndimage.label(alpha)
     if n > 1:
@@ -143,10 +120,6 @@ def clean_alpha(rgba):
         keep = {i + 1 for i, s in enumerate(sizes) if s >= MIN_BLOB_SIZE}
         clean_mask = np.isin(labels, list(keep))
         rgba[~clean_mask, 3] = 0
-        alpha = clean_mask
-
-    alpha = strip_gray_rim(rgba[:, :, :3], alpha)
-    rgba[~alpha, 3] = 0
     return rgba
 
 
