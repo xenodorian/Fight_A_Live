@@ -1,0 +1,5 @@
+*.o
+*.elf
+*.cdi
+src/sprites.h
+ART_NEEDED.md
