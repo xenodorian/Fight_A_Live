@@ -111,8 +111,9 @@ def split_wide_islands(islands, mask_fg):
 
 def clean_alpha(rgba):
     """Drop isolated opaque speckle (webp compression noise not touching the
-    sprite) and keep the alpha cutout strict so no gray background-blend
-    halo survives around the silhouette."""
+    sprite), then erode the alpha mask by exactly 1px on every frame --
+    unconditionally, no color check -- to remove the anti-aliasing/
+    compression fringe ring around the silhouette."""
     alpha = rgba[:, :, 3] > 0
     labels, n = ndimage.label(alpha)
     if n > 1:
@@ -120,6 +121,10 @@ def clean_alpha(rgba):
         keep = {i + 1 for i, s in enumerate(sizes) if s >= MIN_BLOB_SIZE}
         clean_mask = np.isin(labels, list(keep))
         rgba[~clean_mask, 3] = 0
+        alpha = clean_mask
+
+    alpha = ndimage.binary_erosion(alpha, iterations=1)
+    rgba[~alpha, 3] = 0
     return rgba
 
 
