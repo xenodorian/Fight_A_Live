@@ -19,7 +19,46 @@ LABEL_ZONE_X = 100  # px from left that always contains the row-name text label 
 
 ROWS_PER_SHEET = 5
 SHEET_H = 480
-ROW_H = SHEET_H // ROWS_PER_SHEET
+MIN_ROW_GAP = 4  # rows of all-background pixels shorter than this are noise, not a real row boundary
+
+
+def find_row_bands(arr, expected_rows=ROWS_PER_SHEET):
+    """Row heights in these sheets are NOT a uniform 96px grid -- jump/attack
+    poses are taller than idle/walk, so a fixed division cuts into the next
+    row and truncates heads. Detect real row boundaries instead, from bands
+    of all-background rows spanning the full sheet width."""
+    mask_fg = ~bg_mask(arr, SEG_THRESH)
+    has_content = mask_fg.any(axis=1)
+
+    # collapse gaps shorter than MIN_ROW_GAP (anti-aliasing noise, not a real row seam)
+    merged = has_content.copy()
+    i = 0
+    h = len(has_content)
+    while i < h:
+        if not has_content[i]:
+            j = i
+            while j < h and not has_content[j]:
+                j += 1
+            if j - i < MIN_ROW_GAP:
+                merged[i:j] = True
+            i = j
+        else:
+            i += 1
+
+    bands = []
+    i = 0
+    while i < h:
+        if merged[i]:
+            j = i
+            while j < h and merged[j]:
+                j += 1
+            bands.append((i, j - 1))
+            i = j
+        else:
+            i += 1
+
+    assert len(bands) == expected_rows, f"expected {expected_rows} row bands, found {len(bands)}: {bands}"
+    return bands
 
 
 def bg_mask(arr, thresh):
@@ -78,11 +117,14 @@ def process_sheet(path, char_name, row_names, out_dir):
     arr = np.array(im)
     assert arr.shape[0] == SHEET_H, f"unexpected height {arr.shape[0]}"
 
+    bands = find_row_bands(arr, expected_rows=len(row_names))
+
     report = {}
     for i, row_name in enumerate(row_names):
-        y0 = i * ROW_H
-        y1 = y0 + ROW_H
-        row_rgb = arr[y0:y1]
+        y0, y1 = bands[i]
+        # pad a couple rows top/bottom so nothing sits flush against the crop edge
+        pad = 3
+        row_rgb = arr[max(0, y0 - pad):min(SHEET_H, y1 + 1 + pad)]
         saved = process_row(row_rgb, i, out_dir, char_name, row_name)
         report[row_name] = len(saved)
     return report
