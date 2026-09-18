@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Slice craftpix Shinobi preview sheets into individual frame PNGs with
-background removed (chroma-keyed to alpha). Best-effort: these are the
-webp *preview* screenshots (720x480, row labels baked in, no alpha), not
-the original asset zip, so grid detection is done by background-color
-connected-component analysis rather than known cell coordinates.
+"""Fresh slice of the Shinobi protagonist preview sheets.
+
+Background removal is edge-connected: a pixel is only "background" if it's
+reachable from the image border through other background-colored pixels
+(flood fill), not just because its color happens to be close to gray. This
+naturally leaves the character's own colors alone even where they're
+grayish, and also sweeps up stray floating background-colored specks since
+those are still connected to the border through the surrounding background.
+
+After that cutout, every frame gets a flat, unconditional 1px erosion of
+its alpha mask to remove the leftover anti-aliasing/compression fringe --
+no color heuristics, just shrink the opaque region by one pixel everywhere.
 """
 import sys
 from pathlib import Path
@@ -12,28 +19,45 @@ from PIL import Image
 from scipy import ndimage
 
 BG = np.array([162, 162, 162])
-SEG_THRESH = 9    # background-distance threshold used for island/label detection
-ALPHA_THRESH = 70  # final alpha cutout threshold -- must be strict enough to drop webp-compression
-                   # pixels that blend partway to background gray, or they survive as a visible halo
-MIN_BLOB_SIZE = 8  # opaque connected components smaller than this after cropping are speckle noise, not sprite detail
-MERGE_DILATE = 11  # px, merges nearby disconnected sprite parts (e.g. sword arc) into one frame island
-SPLIT_WIDTH_RATIO = 1.6  # an island this many times wider than its row's median is probably two merged frames
-LABEL_ZONE_X = 100  # px from left that always contains the row-name text label (measured: labels end by x=95 in every row/sheet but one); blanked out of the fg mask before dilation so it never fuses with frame 0
+SEG_THRESH = 9
+MERGE_DILATE = 11
+LABEL_ZONE_X = 100
+SPLIT_WIDTH_RATIO = 1.6
 
 ROWS_PER_SHEET = 5
 SHEET_H = 480
-MIN_ROW_GAP = 4  # rows of all-background pixels shorter than this are noise, not a real row boundary
+MIN_ROW_GAP = 4
+
+
+def edge_bg_mask(rgb, close_gaps=False):
+    """Background = connected to the image border through bg-colored pixels.
+    close_gaps bridges single-pixel compression-dither gaps in the
+    background color (common right around a tight crop's own edge) so the
+    flood fill doesn't get trapped by them -- without it, those tiny gaps
+    fragment the background into disconnected pockets that fail the
+    border-connectivity test and get left behind as a speckled halo."""
+    dist = np.abs(rgb.astype(int) - BG).sum(axis=-1)
+    is_bg_color = dist < SEG_THRESH
+    if close_gaps:
+        # border_value=1: without it, closing's erosion pass treats pixels
+        # outside the image as background, which strips the true background
+        # right at the crop's own edge and disconnects it from the border
+        # entirely -- the flood fill then finds nothing to anchor on.
+        is_bg_color = ndimage.binary_closing(is_bg_color, iterations=2, border_value=1)
+    labels, n = ndimage.label(is_bg_color)
+    if n == 0:
+        return np.zeros(rgb.shape[:2], dtype=bool)
+    border_labels = set(labels[0, :]) | set(labels[-1, :]) | set(labels[:, 0]) | set(labels[:, -1])
+    border_labels.discard(0)
+    if not border_labels:
+        return np.zeros(rgb.shape[:2], dtype=bool)
+    return np.isin(labels, list(border_labels))
 
 
 def find_row_bands(arr, expected_rows=ROWS_PER_SHEET):
-    """Row heights in these sheets are NOT a uniform 96px grid -- jump/attack
-    poses are taller than idle/walk, so a fixed division cuts into the next
-    row and truncates heads. Detect real row boundaries instead, from bands
-    of all-background rows spanning the full sheet width."""
-    mask_fg = ~bg_mask(arr, SEG_THRESH)
+    mask_fg = ~edge_bg_mask(arr)
     has_content = mask_fg.any(axis=1)
 
-    # collapse gaps shorter than MIN_ROW_GAP (anti-aliasing noise, not a real row seam)
     merged = has_content.copy()
     i = 0
     h = len(has_content)
@@ -64,16 +88,7 @@ def find_row_bands(arr, expected_rows=ROWS_PER_SHEET):
     return bands
 
 
-def bg_mask(arr, thresh):
-    dist = np.abs(arr.astype(int) - BG).sum(axis=-1)
-    return dist < thresh
-
-
 def split_wide_islands(islands, mask_fg):
-    """An island whose width is a big outlier vs. its row siblings is almost
-    certainly two frames that MERGE_DILATE bridged across a too-small gap
-    (e.g. a kick's trailing motion-arc reaching close to the next pose).
-    Re-split it at the widest internal gap in the *undilated* mask."""
     if len(islands) < 2:
         return islands
     widths = sorted(x1 - x0 + 1 for x0, x1 in islands)
@@ -91,9 +106,6 @@ def split_wide_islands(islands, mask_fg):
                     j = i
                     while j < len(col_has) and not col_has[j]:
                         j += 1
-                    # only interior gaps (real content on both sides) are frame
-                    # boundaries -- a gap touching either edge is just the
-                    # dilation margin around the island, not a split point
                     if i > 0 and j < len(col_has):
                         gaps.append((i, j - 1))
                     i = j
@@ -109,34 +121,11 @@ def split_wide_islands(islands, mask_fg):
     return result
 
 
-def clean_alpha(rgba):
-    """Drop isolated opaque speckle (webp compression noise not touching the
-    sprite), then erode the alpha mask by exactly 1px on every frame --
-    unconditionally, no color check -- to remove the anti-aliasing/
-    compression fringe ring around the silhouette."""
-    alpha = rgba[:, :, 3] > 0
-    labels, n = ndimage.label(alpha)
-    if n > 1:
-        sizes = ndimage.sum(alpha, labels, range(1, n + 1))
-        keep = {i + 1 for i, s in enumerate(sizes) if s >= MIN_BLOB_SIZE}
-        clean_mask = np.isin(labels, list(keep))
-        rgba[~clean_mask, 3] = 0
-        alpha = clean_mask
+def process_row(row_rgb, out_dir, row_name):
+    mask_fg = ~edge_bg_mask(row_rgb)
+    mask_fg[:, :LABEL_ZONE_X] = False
 
-    alpha = ndimage.binary_erosion(alpha, iterations=1)
-    rgba[~alpha, 3] = 0
-    return rgba
-
-
-def process_row(row_rgb, row_index, out_dir, char_name, row_name):
-    h, w, _ = row_rgb.shape
-    mask_fg = ~bg_mask(row_rgb, SEG_THRESH)
-    mask_fg[:, :LABEL_ZONE_X] = False  # blank the row-name label before it can fuse with frame 0
-
-    # remove isolated speckle pixels (webp compression noise) before merging parts
     despeckled = ndimage.binary_opening(mask_fg, iterations=1)
-
-    # merge disconnected sprite parts (blade slashes, separated hands, etc.)
     dilated = ndimage.binary_dilation(despeckled, iterations=MERGE_DILATE)
     labels, n = ndimage.label(dilated)
 
@@ -145,8 +134,7 @@ def process_row(row_rgb, row_index, out_dir, char_name, row_name):
         ys, xs = np.where(labels == i)
         if len(xs) < 20:
             continue
-        x0, x1 = xs.min(), xs.max()
-        islands.append((x0, x1))
+        islands.append((xs.min(), xs.max()))
     islands.sort()
 
     islands = split_wide_islands(islands, mask_fg)
@@ -154,7 +142,6 @@ def process_row(row_rgb, row_index, out_dir, char_name, row_name):
 
     frames = []
     for (x0, x1) in islands:
-        # tight bbox using the *real* (non-dilated, non-despeckled) fg mask within this island's x-range
         col_slice = mask_fg[:, x0:x1 + 1]
         ys, xs = np.where(col_slice)
         if len(xs) == 0:
@@ -165,12 +152,30 @@ def process_row(row_rgb, row_index, out_dir, char_name, row_name):
 
     out_dir.mkdir(parents=True, exist_ok=True)
     saved = []
+    rh, rw, _ = row_rgb.shape
+    PAD = 4  # extra margin so the flood fill has clean background to anchor from at the crop's own border
     for idx, (x0, y0, x1, y1) in enumerate(frames):
-        crop_rgb = row_rgb[y0:y1 + 1, x0:x1 + 1]
-        crop_mask_bg = bg_mask(crop_rgb, ALPHA_THRESH)
-        rgba = np.dstack([crop_rgb, np.full(crop_rgb.shape[:2], 255, dtype=np.uint8)])
-        rgba[crop_mask_bg, 3] = 0
-        rgba = clean_alpha(rgba)
+        px0, py0 = max(0, x0 - PAD), max(0, y0 - PAD)
+        px1, py1 = min(rw, x1 + 1 + PAD), min(rh, y1 + 1 + PAD)
+        crop_rgb = row_rgb[py0:py1, px0:px1]
+
+        # step 1: edge-connected background removal on the padded crop
+        crop_bg = edge_bg_mask(crop_rgb, close_gaps=True)
+        alpha = ~crop_bg
+
+        # step 2: flat 1px erosion, no color heuristics
+        alpha = ndimage.binary_erosion(alpha, iterations=1)
+
+        # trim back down to the tight opaque bbox (drop the padding margin)
+        ys, xs = np.where(alpha)
+        if len(xs) == 0:
+            continue
+        ty0, ty1 = ys.min(), ys.max()
+        tx0, tx1 = xs.min(), xs.max()
+        crop_rgb = crop_rgb[ty0:ty1 + 1, tx0:tx1 + 1]
+        alpha = alpha[ty0:ty1 + 1, tx0:tx1 + 1]
+
+        rgba = np.dstack([crop_rgb, np.where(alpha, 255, 0).astype(np.uint8)])
         img = Image.fromarray(rgba, mode="RGBA")
         fname = out_dir / f"{row_name}_{idx}.png"
         img.save(fname)
@@ -188,10 +193,9 @@ def process_sheet(path, char_name, row_names, out_dir):
     report = {}
     for i, row_name in enumerate(row_names):
         y0, y1 = bands[i]
-        # pad a couple rows top/bottom so nothing sits flush against the crop edge
         pad = 3
         row_rgb = arr[max(0, y0 - pad):min(SHEET_H, y1 + 1 + pad)]
-        saved = process_row(row_rgb, i, out_dir, char_name, row_name)
+        saved = process_row(row_rgb, out_dir, row_name)
         report[row_name] = len(saved)
     return report
 
@@ -201,18 +205,8 @@ if __name__ == "__main__":
     out_root = Path(sys.argv[2])
 
     sheets = [
-        ("protagonist", src_dir / "Free-Shinobi-Sprites-Pixel-Art2-720x480.webp",
-         ["idle", "walk", "run", "jump", "attack1"]),
-        ("protagonist", src_dir / "Free-Shinobi-Sprites-Pixel-Art3-720x480.webp",
-         ["attack2", "attack3", "shield", "hurt", "dead"]),
-        ("enemy1", src_dir / "Free-Shinobi-Sprites-Pixel-Art4-720x480.webp",
-         ["idle", "walk", "run", "jump", "attack1"]),
-        ("enemy1", src_dir / "Free-Shinobi-Sprites-Pixel-Art5-720x480.webp",
-         ["attack2", "attack3", "shield", "hurt", "dead"]),
-        ("boss", src_dir / "Free-Shinobi-Sprites-Pixel-Art6-720x480.webp",
-         ["idle", "walk", "run", "jump", "attack1"]),
-        ("boss", src_dir / "Free-Shinobi-Sprites-Pixel-Art7-720x480.webp",
-         ["attack2", "attack3", "shield", "hurt", "dead"]),
+        ("protagonist", src_dir / "1.png", ["idle", "walk", "run", "jump", "attack1"]),
+        ("protagonist", src_dir / "2.png", ["attack2", "attack3", "shield", "hurt", "dead"]),
     ]
 
     full_report = {}
