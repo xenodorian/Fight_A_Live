@@ -121,6 +121,34 @@ def split_wide_islands(islands, mask_fg):
     return result
 
 
+CHROMA_THRESH = 18   # max(R,G,B)-min(R,G,B) below this = essentially neutral/gray, not a real hue
+MIN_BRIGHTNESS = 60  # protects near-black outline pixels, which are also low-chroma but must stay
+RIM_ITERS = 3
+
+
+def strip_gray_border(rgb, alpha):
+    """Targeted cleanup: only remove boundary pixels that are neutral gray
+    (low chroma) and light enough to be background fringe rather than the
+    character's own dark outline. A pixel that's muted-but-colored (e.g.
+    navy shadow) has real chroma and is left alone even at the same
+    brightness as this fringe; a near-black outline pixel is protected by
+    the brightness floor. Only ever touches pixels already on the boundary
+    (opaque next to transparent), so interior detail is never at risk."""
+    rgb = rgb.astype(int)
+    chroma = rgb.max(axis=-1) - rgb.min(axis=-1)
+    brightness = rgb.mean(axis=-1)
+    grayish = (chroma < CHROMA_THRESH) & (brightness > MIN_BRIGHTNESS)
+
+    mask = alpha.copy()
+    for _ in range(RIM_ITERS):
+        boundary = mask & ~ndimage.binary_erosion(mask)
+        strip = boundary & grayish
+        if not strip.any():
+            break
+        mask = mask & ~strip
+    return mask
+
+
 def process_row(row_rgb, out_dir, row_name):
     mask_fg = ~edge_bg_mask(row_rgb)
     mask_fg[:, :LABEL_ZONE_X] = False
@@ -163,8 +191,9 @@ def process_row(row_rgb, out_dir, row_name):
         crop_bg = edge_bg_mask(crop_rgb, close_gaps=True)
         alpha = ~crop_bg
 
-        # step 2: flat 1px erosion, no color heuristics
-        alpha = ndimage.binary_erosion(alpha, iterations=1)
+        # step 2: targeted removal of remaining gray border pixels only
+        # (low-saturation fringe), leaving real color and dark outline alone
+        alpha = strip_gray_border(crop_rgb, alpha)
 
         # trim back down to the tight opaque bbox (drop the padding margin)
         ys, xs = np.where(alpha)
